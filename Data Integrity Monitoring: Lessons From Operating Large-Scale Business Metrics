@@ -1,0 +1,117 @@
+Data Integrity Monitoring: Lessons From Operating Large-Scale Business Metrics
+Prevent silent metric errors by implementing continuous data integrity monitoring.
+A metric I owned went from roughly 98% precision to about 20% in a single week. Nothing broke. No pipeline alerted. No dashboard turned red. The chart kept rendering on schedule, the refresh timestamps stayed current, and the executive review that Thursday ran off numbers that were mostly fiction.
+The cause was an upstream code change three systems away from my reporting layer. The team that shipped it did everything right by their own standards: they tested their service, their tests passed, they deployed. What they did not know is that a field they treated as internal was the join key for a business metric consumed by four operations teams and one executive scorecard.
+That is the failure mode I want to talk about. Not broken pipelines, which we are all reasonably good at catching. Silent drift, which almost nobody monitors.
+Dashboards Measure Outcomes, Not Trust
+A dashboard tells you what the number is. It does not tell you whether the number still means what it meant last quarter.
+In the environment I work in, the consolidated view a user sees is assembled from eight upstream sources. Each source has its own owner, its own release cadence, and its own definition of "done." Any one of them can change a schema, adjust a business rule, or launch a new product variant that does not fit the existing taxonomy. From the dashboard's perspective, all of that looks identical to a normal Tuesday.
+The things that actually degrade are the things nobody puts on a chart:
+Freshness. Data arrived, but from a partial batch.
+Completeness. A category stopped populating because an enum value changed.
+Consistency. Two sources now disagree on the same entity.
+Logic correctness. The transformation still runs; it just encodes last year's rule.
+Business rule changes. Someone redefined what counts as a defect and told their own team.
+A KPI can look perfectly healthy while being fundamentally wrong. That is not a tooling gap. It is a monitoring gap.
+Treat Data Integrity Like Production Monitoring
+The reframe that changed how my team operates is small and slightly annoying to say out loud, because it sounds obvious once you hear it.
+We stopped asking "is the dashboard working?" and started asking "can we still trust the metric?"
+Those are different questions with different instrumentation. The first one is answered by pipeline health checks. The second one requires you to assert what the data is supposed to look like and alert when reality diverges. That is production monitoring. We just do not usually apply it to business metrics.
+Layer 1: Launch Validation
+Before a metric goes live, we run UAT with the business users who will actually make decisions on it, plus statistical sampling against a manually verified ground truth. Two decisions matter here more than the mechanics.
+Pick your quality metric deliberately. Precision, recall, and accuracy are not equally important, and trying to optimize all three at launch means optimizing none. We chose precision, because false positives were the dominant complaint in early sampling and bad records were the single largest time sink in the user workflow. We still track false negatives and fix them when the impact is large, but we labeled that a secondary metric and wrote the reasoning down. Contextualize this to your business setting, then commit.
+Decide what is an edge case and say so. Some discrepancies are worth engineering time. Some affect two users or half a percent of volume, and the honest answer is to document them as known exclusions rather than pad the data to make the chart look clean. We do not silently fill gaps. If a use case is out of scope, the user should know it is out of scope and bridge it themselves.
+Launch validation is necessary and insufficient. It proves the metric was correct on one day, against one snapshot, under one set of upstream behaviors. All three of those change.
+Layer 2: Continuous Monitoring
+The core of this layer is a scheduled audit that samples production output and compares it against verified truth, plus distribution checks that fire when the shape of the data moves.
+A weekly precision audit is straightforward to express:
+-- Weekly precision audit against the reviewed sample set
+WITH sampled AS (
+  SELECT
+    m.record_id,
+    m.metric_flag        AS predicted,
+    r.reviewed_flag      AS actual,
+    m.source_system,
+    DATE_TRUNC('week', m.event_ts) AS audit_week
+  FROM metric_output m
+  JOIN manual_review  r USING (record_id)
+  WHERE m.event_ts >= CURRENT_DATE - INTERVAL '7 days'
+)
+SELECT
+  audit_week,
+  source_system,
+  COUNT(*)                                              AS sample_size,
+  SUM(CASE WHEN predicted AND actual     THEN 1 ELSE 0 END) AS true_pos,
+  SUM(CASE WHEN predicted AND NOT actual THEN 1 ELSE 0 END) AS false_pos,
+  ROUND(
+    SUM(CASE WHEN predicted AND actual THEN 1 ELSE 0 END)::NUMERIC
+    / NULLIF(SUM(CASE WHEN predicted THEN 1 ELSE 0 END), 0), 4
+  ) AS precision
+FROM sampled
+GROUP BY 1, 2
+ORDER BY precision ASC;
+Grouping by source system matters. An aggregate precision number that drops from 0.97 to 0.91 tells you something is wrong. The same number broken out by source tells you which team to call.
+Alongside the audit, we snapshot key distributions before and after every significant upstream change and compare them:
+def compare_snapshots(before, after, dimension, tolerance=0.03):
+    """Flag categories whose share of volume shifted beyond tolerance."""
+    b = before[dimension].value_counts(normalize=True)
+    a = after[dimension].value_counts(normalize=True)
+
+    findings = []
+    for category in set(b.index) | set(a.index):
+        prior, current = b.get(category, 0.0), a.get(category, 0.0)
+        delta = current - prior
+        if abs(delta) > tolerance:
+            findings.append({
+                "dimension": dimension,
+                "category": category,
+                "before": round(prior, 4),
+                "after": round(current, 4),
+                "delta": round(delta, 4),
+                "severity": "high" if abs(delta) > 3 * tolerance else "medium",
+            })
+    return sorted(findings, key=lambda f: abs(f["delta"]), reverse=True)
+This is deliberately unsophisticated. It has caught more real problems than anything clever we tried, because most integrity failures show up first as a category that stopped appearing or a category that suddenly doubled.
+Layer 3: Ownership and Data Contracts
+The technical layers do not survive contact with a large organization unless someone owns each piece. Our model is:
+Operations defines expected business behavior.
+Product owns business logic.
+Engineering owns implementation.
+BI owns reporting.
+Everyone shares the data quality goal.
+We formalized this as data contracts with each upstream source. A contract is not a document nobody reads. It is a checked-in artifact that the pipeline enforces and that names the humans who must approve changes:
+contract: partner_delivery_events
+version: 3
+owners:
+  producer: partner-integrations-team
+  consumer: business-intelligence
+  approvers: [product-owner, ops-lead, bi-lead]
+schema:
+  - name: delivery_id
+    type: string
+    nullable: false
+  - name: territory_code
+    type: string
+    nullable: false
+    allowed_values_source: reference.territory
+  - name: status
+    type: enum
+    values: [received, validated, published, rejected]
+expectations:
+  freshness_minutes: 60
+  min_daily_volume: 25000
+  null_rate_max:
+    territory_code: 0.001
+change_policy:
+  breaking_change_notice_days: 10
+  requires_consumer_signoff: true
+The version field and the approver list are the parts that do the work. A producer cannot add an enum value without a consumer signoff, and the pipeline fails loudly when it sees a status it was never told about. Getting cross-functional buy-in on that first contract took longer than building the monitoring.
+Layer 4: Governance
+Mechanisms that keep this from decaying into heroics: a weekly working session where the audit results are reviewed by name, a monthly executive review, a launch readiness checklist that blocks release without validation sign-off, mandatory consumer review on code changes touching contracted fields, defined SLAs for data defects by severity, and a flash report that tells users when a known issue exists and what the workaround is.
+That last one is underrated. Telling users "this metric is degraded, here is the manual bridge, here is the fix date" preserves more trust than quietly fixing it later.
+What It Bought Us
+Precision on the flagship metric recovered from roughly 22% to about 98% and has held. Several hundred hours a week of manual validation across the operations teams went away. Business reviews got shorter, because the first fifteen minutes stopped being an argument about whether the numbers were real.
+The part that matters more than any of those numbers is that the operating model was portable. Once the contracts and audit harness existed, extending coverage to on-time rate, mean time to resolution, and first pass yield was configuration work, not a new project.
+This Generalizes
+Any system where decisions are automated on top of aggregated data has this problem. Recommendation engines degrade when an upstream taxonomy shifts. Fraud models drift when a partner changes how they encode a field. Clinical operations dashboards, supply chain planning systems, and financial reporting all sit downstream of producers who do not know who consumes them.
+We talk a lot about becoming data-driven, and we mostly mean building more dashboards. The harder work is making sure the data behind them is still trustworthy on an ordinary Tuesday, not just on launch day. Data integrity is not a validation exercise you complete. It is an operational capability you fund, staff, and keep running.
